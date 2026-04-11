@@ -45,6 +45,7 @@ logger = logging.getLogger('MCP_PIPE')
 # Reconnection settings
 INITIAL_BACKOFF = 1  # Initial wait time in seconds
 MAX_BACKOFF = 600  # Maximum wait time in seconds
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 def validate_endpoint_url(endpoint_url):
@@ -201,9 +202,55 @@ def signal_handler(sig, frame):
     logger.info("Received interrupt signal, shutting down...")
     sys.exit(0)
 
+
+def get_config_path():
+    configured_path = os.environ.get("MCP_CONFIG", "").strip()
+    if configured_path:
+        return os.path.abspath(configured_path)
+    return os.path.join(SCRIPT_DIR, "mcp_config.json")
+
+
+def _resolve_relative_to_config(path_value, config_path):
+    if os.path.isabs(path_value):
+        return path_value
+
+    config_dir = os.path.dirname(config_path)
+    from_config = os.path.normpath(os.path.join(config_dir, path_value))
+    if os.path.exists(from_config):
+        return from_config
+
+    from_cwd = os.path.abspath(path_value)
+    if os.path.exists(from_cwd):
+        return from_cwd
+
+    return from_config
+
+
+def _resolve_python_script_args(args, config_path):
+    resolved_args = [str(arg) for arg in args]
+    expect_module_name = False
+
+    for index, arg in enumerate(resolved_args):
+        if expect_module_name:
+            expect_module_name = False
+            continue
+
+        if arg == "-m":
+            expect_module_name = True
+            continue
+
+        if arg.startswith("-"):
+            continue
+
+        if arg.endswith(".py") or "/" in arg or "\\" in arg:
+            resolved_args[index] = _resolve_relative_to_config(arg, config_path)
+        break
+
+    return resolved_args
+
 def load_config():
     """Load JSON config from $MCP_CONFIG or ./mcp_config.json. Return dict or {}."""
-    path = os.environ.get("MCP_CONFIG") or os.path.join(os.getcwd(), "mcp_config.json")
+    path = get_config_path()
     if not os.path.exists(path):
         return {}
     try:
@@ -225,6 +272,7 @@ def build_server_command(target=None):
     if target is None:
         assert len(sys.argv) >= 2, "missing server name or script path"
         target = sys.argv[1]
+    config_path = get_config_path()
     cfg = load_config()
     servers = cfg.get("mcpServers", {}) if isinstance(cfg, dict) else {}
 
@@ -241,17 +289,20 @@ def build_server_command(target=None):
 
         if typ == "stdio":
             command = entry.get("command")
-            args = entry.get("args") or []
+            args = [str(arg) for arg in (entry.get("args") or [])]
             if not command:
                 raise RuntimeError(f"Server '{target}' is missing 'command'")
 
             resolved_command = str(command)
             if resolved_command.lower() in {"python", "python3", "py"}:
                 resolved_command = sys.executable
+                args = _resolve_python_script_args(args, config_path)
             elif not os.path.isabs(resolved_command):
                 found = shutil.which(resolved_command)
                 if found:
                     resolved_command = found
+                else:
+                    resolved_command = _resolve_relative_to_config(resolved_command, config_path)
 
             return [resolved_command, *args], child_env
 
@@ -274,6 +325,8 @@ def build_server_command(target=None):
 
     # Fallback to script path (back-compat)
     script_path = target
+    if not os.path.isabs(script_path):
+        script_path = _resolve_relative_to_config(script_path, config_path)
     if not os.path.exists(script_path):
         raise RuntimeError(
             f"'{target}' is neither a configured server nor an existing script"

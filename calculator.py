@@ -10,6 +10,10 @@ from typing import Any
 from fastmcp import FastMCP
 
 logger = logging.getLogger('Calculator')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+)
 
 # Fix UTF-8 encoding for Windows console
 if sys.platform == 'win32':
@@ -33,6 +37,13 @@ _UNARY_OPS = {
     ast.UAdd: operator.pos,
     ast.USub: operator.neg,
 }
+
+
+def _preview_expression(expr: str, max_chars: int = 160) -> str:
+    compact = ' '.join((expr or '').split())
+    if len(compact) <= max_chars:
+        return compact
+    return compact[: max_chars - 3] + '...'
 
 
 def _safe_eval(expr: str) -> Any:
@@ -89,13 +100,14 @@ def _safe_eval(expr: str) -> Any:
 @mcp.tool()
 def calculator(python_expression: str) -> dict:
     """For mathamatical calculation, always use this tool to calculate the result of a python expression. You can use 'math' or 'random' directly, without 'import'."""
+    logger.info('Tool calculator invoked expression=%s', _preview_expression(python_expression))
     try:
         result = _safe_eval(python_expression)
     except Exception as exc:
-        logger.warning("Invalid calculator expression: %s", exc)
+        logger.warning("Tool calculator failed: %s", exc)
         return {"success": False, "error": str(exc)}
 
-    logger.info(f"Calculating formula: {python_expression}, result: {result}")
+    logger.info('Tool calculator completed success=true result=%s', result)
     return {"success": True, "result": result}
 
 # Start the server

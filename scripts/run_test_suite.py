@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import re
 import sys
 import time
@@ -15,15 +16,25 @@ if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
 API_KEY_RE = re.compile(r"sk-[^\s'\"}]+")
+GOOGLE_KEY_RE = re.compile(r"AIza[0-9A-Za-z\-_]{20,}")
+QUERY_KEY_RE = re.compile(r"(?i)([?&](?:api_)?key=)[^&\s]+")
 SCHEMA_ID = "mcp.eval.scenario.v1"
+DEFAULT_SCENARIO_PATH = WORKSPACE_ROOT / "test" / "scenario.json"
+DEFAULT_OUTPUT_DIR = WORKSPACE_ROOT / "test" / "reports"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("run_test_suite")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run legal-answer scenario tests and generate standardized reports."
     )
-    parser.add_argument("--scenario", default="test/scenario.json", help="Scenario file path.")
-    parser.add_argument("--output-dir", default="test/reports", help="Report output directory.")
+    parser.add_argument("--scenario", default=str(DEFAULT_SCENARIO_PATH), help="Scenario file path.")
+    parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR), help="Report output directory.")
     parser.add_argument("--top-k", type=int, default=4, help="Retriever top_k for each test case.")
     parser.add_argument(
         "--include-graph",
@@ -46,7 +57,10 @@ def utc_now() -> str:
 
 
 def sanitize_error_text(error: Any) -> str:
-    return API_KEY_RE.sub("sk-***", str(error))
+    text = API_KEY_RE.sub("sk-***", str(error))
+    text = GOOGLE_KEY_RE.sub("AIza***", text)
+    text = QUERY_KEY_RE.sub(r"\1***", text)
+    return text
 
 
 def load_json(path: Path) -> Dict[str, Any]:
@@ -54,11 +68,79 @@ def load_json(path: Path) -> Dict[str, Any]:
         return json.load(file_obj)
 
 
+def resolve_existing_path(raw_path: str) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+
+    from_cwd = (Path.cwd() / candidate).resolve()
+    if from_cwd.exists():
+        return from_cwd
+
+    return (WORKSPACE_ROOT / candidate).resolve()
+
+
+def resolve_output_dir(raw_path: str) -> Path:
+    candidate = Path(raw_path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+    return (WORKSPACE_ROOT / candidate).resolve()
+
+
 def normalize_for_match(value: str) -> str:
     value = unicodedata.normalize("NFKD", value)
     value = "".join(ch for ch in value if not unicodedata.combining(ch))
     value = re.sub(r"\s+", " ", value.lower())
     return value.strip()
+
+
+def _slug_from_text(value: str) -> str:
+    slug = normalize_for_match(value)
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    return slug.strip("-") or "legacy-dataset"
+
+
+def normalize_scenario_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if payload.get("schema") == SCHEMA_ID:
+        return payload
+
+    legacy_cases = payload.get("test_cases")
+    if not isinstance(legacy_cases, list):
+        return payload
+
+    dataset_name = str(payload.get("dataset_name") or "Legacy scenario dataset").strip()
+    normalized_cases: List[Dict[str, Any]] = []
+
+    for idx, case in enumerate(legacy_cases, 1):
+        if not isinstance(case, dict):
+            continue
+
+        case_id = str(case.get("id") or f"legacy-{idx}").strip()
+        query = str(case.get("input_query") or "").strip()
+        success_criteria = str(case.get("success_criteria") or "").strip()
+        expected_contains = [success_criteria] if success_criteria else []
+
+        normalized_cases.append(
+            {
+                "case_id": case_id,
+                "input": {"query": query},
+                "expected": {"contains": expected_contains},
+                "category": str(case.get("test_category") or "legacy"),
+                "description": str(case.get("description") or ""),
+            }
+        )
+
+    logger.info("Detected legacy scenario format and converted it to %s.", SCHEMA_ID)
+    return {
+        "schema": SCHEMA_ID,
+        "metadata": {
+            "dataset_id": _slug_from_text(dataset_name),
+            "dataset_name": dataset_name,
+            "description": str(payload.get("description") or ""),
+            "source_format": "legacy.test_cases.v0",
+        },
+        "cases": normalized_cases,
+    }
 
 
 def validate_standard_scenario(payload: Dict[str, Any]) -> List[str]:
@@ -181,11 +263,15 @@ def write_markdown_report(path: Path, report: Dict[str, Any]) -> None:
 def main() -> int:
     args = parse_args()
 
-    scenario_path = Path(args.scenario)
+    scenario_path = resolve_existing_path(args.scenario)
     if not scenario_path.exists():
         raise FileNotFoundError(f"Scenario file not found: {scenario_path}")
 
-    scenario = load_json(scenario_path)
+    scenario = normalize_scenario_payload(load_json(scenario_path))
+    output_dir = resolve_output_dir(args.output_dir)
+
+    logger.info("Scenario file: %s", scenario_path)
+    logger.info("Output directory: %s", output_dir)
 
     errors = validate_standard_scenario(scenario)
     if errors:
@@ -207,6 +293,7 @@ def main() -> int:
             "use_cache": bool(args.use_cache),
             "dry_run": bool(args.dry_run),
             "case_count": len(cases),
+            "output_dir": str(output_dir),
         },
         "summary": {},
         "category_stats": {},
@@ -214,14 +301,32 @@ def main() -> int:
     }
 
     latencies: List[float] = []
+    answer_legal_question = None
 
     if not args.dry_run:
-        from legal_answer_server import answer_legal_question
+        from legal_answer_server import answer_legal_question as _answer_legal_question, answer_service_healthcheck
+
+        answer_legal_question = _answer_legal_question
+
+        try:
+            health = answer_service_healthcheck()
+            report["healthcheck"] = health
+            logger.info(
+                "answer_service_healthcheck success=%s missing_env=%s",
+                health.get("success"),
+                ",".join(health.get("missing_env") or []),
+            )
+        except Exception as exc:
+            safe_error = sanitize_error_text(exc)
+            report["healthcheck"] = {"success": False, "error": safe_error}
+            logger.error("answer_service_healthcheck failed: %s", safe_error)
 
     for case in cases:
         case_id = str(case.get("case_id"))
         category = str(case.get("category") or "unknown")
         query = str((case.get("input") or {}).get("query") or "").strip()
+
+        logger.info("Case %s started (category=%s)", case_id, category)
 
         status = "passed"
         answer = ""
@@ -234,6 +339,7 @@ def main() -> int:
         else:
             started = time.perf_counter()
             try:
+                assert answer_legal_question is not None
                 out = answer_legal_question(
                     question=query,
                     top_k=max(1, int(args.top_k)),
@@ -243,7 +349,10 @@ def main() -> int:
                 latency_ms = (time.perf_counter() - started) * 1000.0
                 latencies.append(latency_ms)
 
-                if not out.get("success"):
+                if not isinstance(out, dict):
+                    status = "error"
+                    error = f"unexpected tool response type: {type(out).__name__}"
+                elif not out.get("success"):
                     status = "error"
                     error = sanitize_error_text(out.get("error") or "unknown error")
                 else:
@@ -268,6 +377,18 @@ def main() -> int:
             "latency_ms": round(latency_ms, 2),
         }
         report["results"].append(result_item)
+
+        if status == "error":
+            logger.error("Case %s -> error (latency_ms=%.2f): %s", case_id, latency_ms, error)
+        elif status == "failed":
+            logger.warning(
+                "Case %s -> failed (latency_ms=%.2f), missing=%s",
+                case_id,
+                latency_ms,
+                ", ".join(missing_phrases),
+            )
+        else:
+            logger.info("Case %s -> %s (latency_ms=%.2f)", case_id, status, latency_ms)
 
         stat = report["category_stats"].setdefault(category, {"total": 0, "passed": 0})
         stat["total"] += 1
@@ -294,7 +415,6 @@ def main() -> int:
     }
     report["finished_at"] = utc_now()
 
-    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     json_path = output_dir / f"test-report-{ts}.json"

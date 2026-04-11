@@ -39,6 +39,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger("LegalAnswerServer")
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 mcp = FastMCP("LegalAnswerServer")
 
@@ -49,6 +51,8 @@ CONTEXT_CHAR_BUDGET = max(1000, int(os.getenv("MCP_CONTEXT_CHAR_BUDGET", "2800")
 MAX_CONTEXT_ITEMS = max(1, int(os.getenv("MCP_MAX_CONTEXT_ITEMS", "8")))
 MAX_ITEM_CHARS = max(120, int(os.getenv("MCP_MAX_ITEM_CHARS", "700")))
 API_KEY_RE = re.compile(r"sk-[^\s'\"}]+")
+GOOGLE_KEY_RE = re.compile(r"AIza[0-9A-Za-z\-_]{20,}")
+QUERY_KEY_RE = re.compile(r"(?i)([?&](?:api_)?key=)[^&\s]+")
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -64,7 +68,19 @@ def _normalize_query(query: str) -> str:
 
 
 def _sanitize_error_text(error: Any) -> str:
-    return API_KEY_RE.sub("sk-***", str(error))
+    text = API_KEY_RE.sub("sk-***", str(error))
+    text = GOOGLE_KEY_RE.sub("AIza***", text)
+    text = QUERY_KEY_RE.sub(r"\1***", text)
+    return text
+
+
+def _preview_query(query: str, max_chars: int = 160) -> str:
+    return _truncate(" ".join((query or "").split()), max_chars)
+
+
+def _env_flag(name: str, default: str = "0") -> bool:
+    value = str(os.getenv(name, default)).strip().lower()
+    return value in {"1", "true", "yes", "on"}
 
 
 def _coerce_vector_dimension(vector: List[float], target_dim: Optional[int]) -> List[float]:
@@ -85,6 +101,8 @@ class HybridAnswerRuntime:
         self._milvus_client = None
         self._neo4j_driver = None
         self._provider_fallback = ProviderClientFallback()
+        self._provider_probe: Dict[str, Any] = {}
+        self._provider_connectivity_verified = False
         self._active_generation_provider: Optional[str] = None
         self._active_embedding_provider: Optional[str] = None
 
@@ -104,7 +122,40 @@ class HybridAnswerRuntime:
         self._neo4j_password = os.getenv("MCP_NEO4J_PASSWORD", "").strip()
         self._neo4j_database = os.getenv("MCP_NEO4J_DATABASE", "").strip()
 
+        self._verify_provider_on_startup = _env_flag("MCP_VERIFY_PROVIDER_ON_STARTUP", "1")
+        self._verify_embeddings_on_startup = _env_flag("MCP_VERIFY_PROVIDER_EMBEDDINGS", "1")
+
         self._answer_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+    def _verify_provider_connectivity(self) -> None:
+        if self._provider_connectivity_verified:
+            return
+
+        if not self._verify_provider_on_startup:
+            self._provider_probe = {
+                "enabled": False,
+                "generation_provider": None,
+                "embedding_provider": None,
+                "embedding_dimensions": None,
+            }
+            self._provider_connectivity_verified = True
+            return
+
+        probe = self._provider_fallback.verify_connectivity(
+            verify_generation=True,
+            verify_embeddings=self._verify_embeddings_on_startup,
+        )
+        self._provider_probe = {
+            "enabled": True,
+            **probe,
+        }
+        self._provider_connectivity_verified = True
+        logger.info(
+            "Provider connectivity verified generation=%s embedding=%s embedding_dim=%s",
+            probe.get("generation_provider"),
+            probe.get("embedding_provider"),
+            probe.get("embedding_dimensions"),
+        )
 
     def _cache_key(self, query: str, top_k: int, include_graph: bool) -> str:
         return f"{top_k}:{int(include_graph)}:{query.lower()}"
@@ -232,6 +283,7 @@ class HybridAnswerRuntime:
                 embedding_model=self._embedding_model,
             )
             self._provider_fallback.validate(require_generation=True, require_embeddings=True)
+            self._verify_provider_connectivity()
 
             if PyMilvusClient is not None:
                 if self._is_online_milvus_config() and not self._milvus_token:
@@ -293,6 +345,7 @@ class HybridAnswerRuntime:
             "success": success,
             "missing_env": missing,
             "init_error": init_error,
+            "provider_connectivity": dict(self._provider_probe),
             "dependencies": {
                 "openai_sdk": OpenAI is not None,
                 "pymilvus": PyMilvusClient is not None,
@@ -606,7 +659,13 @@ _RUNTIME = HybridAnswerRuntime()
 @mcp.tool()
 def answer_service_healthcheck() -> Dict[str, Any]:
     """Return health and dependency status for the standalone legal answer pipeline."""
-    return _RUNTIME.health()
+    logger.info("Tool answer_service_healthcheck invoked")
+    result = _RUNTIME.health()
+    logger.info(
+        "Tool answer_service_healthcheck completed success=%s",
+        result.get("success"),
+    )
+    return result
 
 
 @mcp.tool()
@@ -617,13 +676,33 @@ def answer_legal_question(
     use_cache: bool = True,
 ) -> Dict[str, Any]:
     """Answer legal question with standalone hybrid workflow: normalize -> KB -> KG -> grounded LLM."""
+    logger.info(
+        "Tool answer_legal_question invoked top_k=%s include_graph=%s use_cache=%s question=%s",
+        top_k,
+        include_graph,
+        use_cache,
+        _preview_query(question),
+    )
     try:
-        return _RUNTIME.answer(
+        result = _RUNTIME.answer(
             question=question,
             top_k=top_k,
             include_graph=include_graph,
             use_cache=use_cache,
         )
+        latency = result.get("latency_ms") or {}
+        retrieved = result.get("retrieved") or {}
+        providers = result.get("providers") or {}
+        logger.info(
+            "Tool answer_legal_question completed success=%s kb=%s kg=%s cache_hit=%s provider=%s total_latency_ms=%s",
+            result.get("success"),
+            retrieved.get("kb"),
+            retrieved.get("kg"),
+            result.get("cache_hit"),
+            providers.get("generation"),
+            latency.get("total"),
+        )
+        return result
     except Exception as exc:
         safe_error = _sanitize_error_text(exc)
         logger.error("answer_legal_question failed: %s", safe_error)
@@ -635,6 +714,10 @@ def answer_legal_question(
 
 if __name__ == "__main__":
     try:
+        _RUNTIME.ensure_ready()
         mcp.run(transport="stdio")
+    except Exception as exc:
+        logger.error("Startup preflight failed: %s", _sanitize_error_text(exc))
+        raise SystemExit(1)
     finally:
         _RUNTIME.close()

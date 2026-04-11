@@ -39,13 +39,15 @@ Required for bridge:
 
 Required for legal-answer pipeline:
 
-- At least one generation key (priority: OpenAI -> Claude -> Gemini -> TogetherAI):
+- Cloud mode (default) requires at least one generation key (priority: OpenAI -> Claude -> Gemini -> TogetherAI):
 	- `MCP_OPENAI_API_KEY`
-	- `MCP_CLAUDE_API_KEY` (or `MCP_ANTHROPIC_API_KEY`)
+	- `MCP_CLAUDE_API_KEY` (or aliases `MCP_ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY`)
 	- `MCP_GEMINI_API_KEY`
 	- `MCP_TOGETHER_API_KEY`
-- At least one embedding-capable key:
+- Cloud mode also requires at least one embedding-capable key:
 	- `MCP_OPENAI_API_KEY` or `MCP_GEMINI_API_KEY` or `MCP_TOGETHER_API_KEY`
+	- Optional aliases are also accepted: `OPENAI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `TOGETHER_API_KEY`
+- Local mode (`MCP_MODE=local` or `MCP_LOCAL_MODE=1`) uses local Ollama models for both generation and embeddings, so cloud API keys are optional.
 - `MCP_MILVUS_ENDPOINT` (or `MCP_MILVUS_URI` for local Milvus)
 - `MCP_MILVUS_TOKEN` (required when using online/Zilliz endpoint)
 - `MCP_MILVUS_COLLECTION`
@@ -71,6 +73,49 @@ Optional tuning:
 - `MCP_CLAUDE_LLM_MODEL`
 - `MCP_GEMINI_LLM_MODEL`, `MCP_GEMINI_EMBEDDING_MODEL`, `MCP_GEMINI_BASE_URL`
 - `MCP_TOGETHER_LLM_MODEL`, `MCP_TOGETHER_EMBEDDING_MODEL`, `MCP_TOGETHER_BASE_URL`
+- `MCP_PREFERRED_GENERATION_PROVIDER` (`openai|claude|gemini|togetherai`)
+- `MCP_PREFERRED_EMBEDDING_PROVIDER` (`openai|gemini|togetherai`)
+- `MCP_STRICT_PREFERRED_PROVIDER` (default `0`; when `1`, do not fallback to other providers)
+- `MCP_VERIFY_PROVIDER_ON_STARTUP` (default `1`, fail startup if no provider can be reached)
+- `MCP_VERIFY_PROVIDER_EMBEDDINGS` (default `1`, include embedding API probe at startup)
+- `MCP_MODE` (`cloud|local`, default `cloud`)
+- `MCP_LOCAL_MODE` (`0|1`, local mode shortcut)
+- `MCP_LOCAL_BASE_URL` (default `http://127.0.0.1:11434`)
+- `MCP_LOCAL_LLM_MODEL` (default `llama3.1:8b`)
+- `MCP_LOCAL_EMBEDDING_MODEL` (default `nomic-embed-text`)
+- `MCP_PROVIDER_TIMEOUT_SECONDS` (default `60` in cloud mode, `180` in local mode)
+
+## Local Model Setup (16GB RAM)
+
+Recommended local model pair for 16GB RAM / 512GB storage:
+
+- LLM: `llama3.1:8b` (good quality/speed tradeoff)
+- Embeddings: `nomic-embed-text`
+
+Install Ollama, then pull both models:
+
+```bash
+ollama pull llama3.1:8b
+ollama pull nomic-embed-text
+```
+
+Windows quick setup (pull models, write `.env`, install dependencies):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup_local_mode.ps1
+```
+
+Enable local mode in `.env`:
+
+```env
+MCP_MODE=local
+MCP_LOCAL_MODE=1
+MCP_LOCAL_BASE_URL=http://127.0.0.1:11434
+MCP_LOCAL_LLM_MODEL=llama3.1:8b
+MCP_LOCAL_EMBEDDING_MODEL=nomic-embed-text
+```
+
+After that, start the legal answer server as usual (for example via `python mcp_pipe.py legal-answer`).
 
 ## Run
 
