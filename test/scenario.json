@@ -4,7 +4,7 @@
   "test_cases": [
   {
     "id":  "TW-1",
-    "input_query":"Nghị quyết số 57-NQ/TW do ai ký ban hành?",
+    "input_query":"Nghị quyết số 57-NQ/TW do ai ký?",
     "success_criteria": "Tổng Bí thư Tô Lâm.",
     "test_category": "Trích xuất thực thể (Entity Extraction)",
     "description": "Kiểm tra khả năng trích xuất thông tin người ký ban hành nghị quyết."

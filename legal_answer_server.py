@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import difflib
+import itertools
 import json
 import logging
 import os
@@ -133,6 +134,8 @@ KNOWN_QUERY_TOKENS = {
     "an", "ninh", "mang", "khong", "gian", "su", "xuyen", "khong", "the", "tach", "roi", "57", "tw",
 }
 
+VIET_TOKEN_REPAIR_ALPHABET = "aeiouy"
+
 
 def _truncate(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
@@ -156,7 +159,7 @@ def _truncate_with_tail(text: str, max_chars: int, tail_ratio: float = 0.35) -> 
 
 
 def _normalize_query(query: str) -> str:
-    compact = " ".join(query.strip().split())
+    compact = _normalize_vietnamese_text(query)
     compact = re.sub(r"\s+([,.;:!?])", r"\1", compact)
     return compact
 
@@ -178,6 +181,76 @@ def _preview_result_payload(payload: Any, max_chars: int = 1800) -> str:
     except Exception:
         compact = str(payload)
     return _truncate_with_tail(compact, max_chars)
+
+
+def _normalize_vietnamese_text(value: str) -> str:
+    text = unicodedata.normalize("NFKC", value or "")
+    text = text.replace("\u00a0", " ")
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _strip_vietnamese_diacritics(value: str) -> str:
+    text = unicodedata.normalize("NFKD", value or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.replace("đ", "d").replace("Đ", "D")
+    return text
+
+
+def _build_normalization_vocabulary() -> set[str]:
+    vocabulary = set(KNOWN_QUERY_TOKENS)
+    for phrase in list(CANONICAL_PHRASE_MAP.keys()) + list(CANONICAL_PHRASE_MAP.values()):
+        normalized = _strip_vietnamese_diacritics(phrase.lower())
+        vocabulary.update(re.findall(r"[a-z0-9]+", normalized))
+    return vocabulary
+
+
+NORMALIZATION_VOCABULARY = _build_normalization_vocabulary()
+
+
+def _repair_placeholder_token(token: str) -> str:
+    if "?" not in token:
+        return token
+
+    base = token.replace("?", "")
+    candidates = {base} if base else set()
+
+    question_positions = [idx for idx, ch in enumerate(token) if ch == "?"]
+    if 0 < len(question_positions) <= 2:
+        for replacements in itertools.product(VIET_TOKEN_REPAIR_ALPHABET, repeat=len(question_positions)):
+            chars = list(token)
+            for pos, repl in zip(question_positions, replacements):
+                chars[pos] = repl
+            candidates.add("".join(chars))
+
+    best = token
+    best_ratio = 0.0
+    for candidate in candidates:
+        if candidate in NORMALIZATION_VOCABULARY:
+            ratio = difflib.SequenceMatcher(None, token, candidate).ratio()
+            if ratio > best_ratio:
+                best = candidate
+                best_ratio = ratio
+
+    if best != token:
+        return best
+
+    close = difflib.get_close_matches(base or token, sorted(NORMALIZATION_VOCABULARY), n=1, cutoff=0.86)
+    if close:
+        return close[0]
+
+    return token
+
+
+def _repair_placeholder_tokens(text: str) -> str:
+    tokens = re.findall(r"[a-z0-9?]+", text.lower())
+    if not tokens:
+        return ""
+    repaired = [_repair_placeholder_token(token) for token in tokens]
+    return " ".join(repaired)
 
 
 def _expand_query_abbreviations(query: str) -> str:
@@ -206,7 +279,24 @@ def _restore_common_legal_phrases(query: str) -> str:
             span = len(phrase_tokens)
             if span == 0 or idx + span > len(normalized_tokens):
                 continue
-            if normalized_tokens[idx : idx + span] == phrase_tokens:
+
+            window = normalized_tokens[idx : idx + span]
+            if window == phrase_tokens:
+                out_parts.append(canonical_phrase)
+                idx += span
+                matched = True
+                break
+
+            # Fuzzy phrase match to recover slightly corrupted Vietnamese tokens,
+            # for example "doi moi sang to" -> "đổi mới sáng tạo".
+            token_scores = [
+                difflib.SequenceMatcher(None, observed, expected).ratio()
+                for observed, expected in zip(window, phrase_tokens)
+            ]
+            avg_score = sum(token_scores) / float(len(token_scores)) if token_scores else 0.0
+            min_score = min(token_scores) if token_scores else 0.0
+
+            if avg_score >= 0.90 and min_score >= 0.60:
                 out_parts.append(canonical_phrase)
                 idx += span
                 matched = True
@@ -269,16 +359,18 @@ def _build_query_variants(question: str) -> List[Dict[str, Any]]:
     if expanded_query != base_query:
         push(expanded_query, "abbreviation_expansion")
 
-    accent_insensitive = _normalize_for_tokens(expanded_query or base_query)
-    if accent_insensitive and accent_insensitive != _normalize_for_tokens(base_query):
-        push(accent_insensitive, "accent_insensitive_normalization")
+    normalized_for_matching = _normalize_for_tokens(expanded_query or base_query)
 
-    fuzzy_query, corrections = _fuzzy_correct_query_tokens(accent_insensitive or expanded_query or base_query)
-    if fuzzy_query and fuzzy_query != accent_insensitive:
-        push(fuzzy_query, "fuzzy_token_correction", corrections)
+    fuzzy_query, corrections = _fuzzy_correct_query_tokens(
+        normalized_for_matching or expanded_query or base_query
+    )
+    if fuzzy_query and fuzzy_query != normalized_for_matching:
+        push(_restore_common_legal_phrases(fuzzy_query), "fuzzy_token_correction", corrections)
 
-    restored_query = _restore_common_legal_phrases(fuzzy_query or accent_insensitive or expanded_query or base_query)
-    if restored_query and restored_query != (fuzzy_query or accent_insensitive):
+    restored_query = _restore_common_legal_phrases(
+        fuzzy_query or normalized_for_matching or expanded_query or base_query
+    )
+    if restored_query and restored_query != expanded_query:
         push(restored_query, "canonical_phrase_restore")
 
     return variants or [{"query": base_query, "method": "original"}]
@@ -295,10 +387,9 @@ def _env_flag(name: str, default: str = "0") -> bool:
 
 
 def _normalize_for_tokens(value: str) -> str:
-    text = unicodedata.normalize("NFKD", value or "")
-    text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    text = text.replace("đ", "d").replace("Đ", "D")
-    text = text.lower()
+    text = _normalize_vietnamese_text(value)
+    text = _strip_vietnamese_diacritics(text).lower()
+    text = _repair_placeholder_tokens(text)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
@@ -321,15 +412,93 @@ def _lexical_overlap_score(query_tokens: List[str], candidate_text: str) -> floa
 
 
 def _is_issuance_query(normalized_query: str) -> bool:
+    if _is_signer_query(normalized_query):
+        return True
+
     patterns = [
-        "ky ban hanh",
-        "nguoi ky",
         "duoc ban hanh",
         "ngay thang nam",
         "co quan nao ban hanh",
         "co quan ban hanh",
     ]
     return any(pattern in normalized_query for pattern in patterns)
+
+
+def _is_signer_query(normalized_query: str) -> bool:
+    patterns = [
+        "ky ban hanh",
+        "nguoi ky",
+        "do ai ky",
+        "ai ky",
+        "ky boi ai",
+        "ai la nguoi ky",
+    ]
+    return any(pattern in normalized_query for pattern in patterns)
+
+
+def _extract_signer_name(kb_text: str) -> str:
+    patterns = [
+        r"T/M\s+BỘ\s+CHÍNH\s+TRỊ\s*\n+\s*TỔNG\s+BÍ\s+THƯ\s*\n+\s*([A-ZÀ-ỸĐ][A-Za-zÀ-ỹĐđ\s]{1,80})",
+        r"TỔNG\s+BÍ\s+THƯ(?:\s*[:\-–]\s*|\s*\n+\s*|\s+)([A-ZÀ-ỸĐ][A-Za-zÀ-ỹĐđ\s]{1,80})",
+    ]
+
+    blocked_tokens = {
+        "ban",
+        "chap",
+        "hanh",
+        "trung",
+        "uong",
+        "dang",
+        "bo",
+        "chinh",
+        "tri",
+        "dong",
+        "chi",
+        "truong",
+        "hoi",
+    }
+
+    for pattern in patterns:
+        for signer_match in re.finditer(pattern, kb_text, flags=re.IGNORECASE):
+            signer_raw = " ".join(signer_match.group(1).split())
+            words = signer_raw.split()
+            signer_words: List[str] = []
+            for word in words:
+                if not word:
+                    continue
+                first = word[0]
+                if not first.isalpha() or not first.isupper():
+                    break
+
+                normalized_word = _normalize_for_tokens(word)
+                if signer_words and normalized_word in blocked_tokens:
+                    break
+
+                signer_words.append(word)
+                if len(signer_words) >= 4:
+                    break
+
+            while signer_words:
+                tail_norm = _normalize_for_tokens(signer_words[-1])
+                if tail_norm in {"chu", "cua", "bo", "chinh", "tri"}:
+                    signer_words.pop()
+                    continue
+                break
+
+            if len(signer_words) < 2:
+                continue
+
+            signer_norm_tokens = [_normalize_for_tokens(token) for token in signer_words]
+            if signer_norm_tokens[0] in {"ban", "dong", "chi", "hoi", "bo"}:
+                continue
+
+            blocked_count = sum(1 for token in signer_norm_tokens if token in blocked_tokens)
+            if blocked_count >= 2:
+                continue
+
+            return " ".join(signer_words)
+
+    return ""
 
 
 def _sentence_case(text: str) -> str:
@@ -891,36 +1060,10 @@ class HybridAnswerRuntime:
             return None
         normalized_kb_text = _normalize_for_tokens(kb_text)
 
-        if "ky ban hanh" in normalized_query or "nguoi ky" in normalized_query:
-            signer_match = re.search(
-                r"TỔNG\s+BÍ\s+THƯ\s*\n+\s*([A-ZÀ-ỸĐ][A-Za-zÀ-ỹĐđ\s]{1,80})",
-                kb_text,
-                flags=re.IGNORECASE,
-            )
-            if signer_match:
-                signer_raw = " ".join(signer_match.group(1).split())
-                words = signer_raw.split()
-                signer_words: List[str] = []
-                for word in words:
-                    if not word:
-                        continue
-                    first = word[0]
-                    if not first.isalpha() or not first.isupper():
-                        break
-                    signer_words.append(word)
-                    if len(signer_words) >= 4:
-                        break
-
-                while signer_words:
-                    tail_norm = _normalize_for_tokens(signer_words[-1])
-                    if tail_norm in {"chu", "cua", "bo", "chinh", "tri"}:
-                        signer_words.pop()
-                        continue
-                    break
-
-                signer = " ".join(signer_words)
-                if signer:
-                    return f"Tổng Bí thư {signer}."
+        if _is_signer_query(normalized_query):
+            signer = _extract_signer_name(kb_text)
+            if signer:
+                return f"Tổng Bí thư {signer}."
 
         if "ban hanh" in normalized_query and "ngay" in normalized_query:
             date_match = re.search(
@@ -1013,20 +1156,20 @@ class HybridAnswerRuntime:
     ) -> str:
         total_sources = int(kb_count) + int(kg_count)
         prompt = (
-            "You are a Vietnamese legal assistant. Use the provided context only.\n\n"
-            f"Evidence summary: KB={kb_count}, KG={kg_count}, total={total_sources}.\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {query}\n\n"
-            "Guidelines:\n"
-            "- Return at most 2 short lines in Vietnamese.\n"
-            "- Prefer exact wording from context for names, dates, organizations, and numbers.\n"
-            "- If evidence is weak, say so briefly and give the closest supported answer.\n"
-            "- Do not invent facts not present in context."
+            "Bạn là trợ lý pháp lý tiếng Việt. Chỉ sử dụng thông tin trong ngữ cảnh đã cho.\n\n"
+            f"Tóm tắt bằng chứng: KB={kb_count}, KG={kg_count}, tổng={total_sources}.\n"
+            f"Ngữ cảnh:\n{context}\n\n"
+            f"Câu hỏi: {query}\n\n"
+            "Yêu cầu:\n"
+            "- Trả lời tối đa 2 dòng, ngắn gọn, trực diện, bằng tiếng Việt.\n"
+            "- Ưu tiên đúng nguyên văn tên riêng, mốc thời gian, cơ quan và số liệu trong ngữ cảnh.\n"
+            "- Nếu bằng chứng còn hạn chế, nêu ngắn gọn điều đó rồi trả lời theo bằng chứng gần nhất.\n"
+            "- Không suy diễn hoặc bịa thông tin ngoài ngữ cảnh."
         )
 
         answer_text, provider = self._provider_fallback.generate_text(
             prompt=prompt,
-            system="Answer in Vietnamese. Concise, factual, grounded. Max 2 lines.",
+            system="Luôn trả lời bằng tiếng Việt, ngắn gọn, bám sát bằng chứng, tối đa 2 dòng.",
             temperature=0.0,
             max_tokens=max_tokens,
         )
@@ -1035,7 +1178,7 @@ class HybridAnswerRuntime:
 
     def answer(self, question: str, top_k: int = DEFAULT_TOP_K, include_graph: bool = True, use_cache: bool = True) -> Dict[str, Any]:
         if not question or not question.strip():
-            return {"success": False, "error": "question must not be empty"}
+            return {"success": False, "error": "Câu hỏi không được để trống."}
 
         self.ensure_ready()
         safe_top_k = max(1, min(int(top_k), MAX_TOP_K))
@@ -1047,6 +1190,9 @@ class HybridAnswerRuntime:
             if cached is not None:
                 out = dict(cached)
                 out["cache_hit"] = True
+                if "legal_related" not in out:
+                    retrieved = out.get("retrieved") or {}
+                    out["legal_related"] = bool(retrieved.get("kb") or retrieved.get("kg"))
                 return out
 
         t0 = time.perf_counter()
@@ -1122,8 +1268,10 @@ class HybridAnswerRuntime:
             else query_used
         )
 
+        signer_query = _is_signer_query(_normalize_for_tokens(interpreted_query))
+
         if not kb_hits:
-            answer_text = "No relevant evidence found in the configured knowledge stores."
+            answer_text = "Không tìm thấy bằng chứng phù hợp trong kho tri thức hiện có."
             if query_correction:
                 answer_text = (
                     f"Đã tự hiệu chỉnh truy vấn gần đúng thành: \"{query_correction['corrected_query']}\". "
@@ -1132,6 +1280,7 @@ class HybridAnswerRuntime:
 
             response = {
                 "success": True,
+                "legal_related": False,
                 "query": normalized_query,
                 "query_used": interpreted_query,
                 "query_correction": query_correction,
@@ -1150,6 +1299,13 @@ class HybridAnswerRuntime:
             return response
 
         direct_answer = self._extract_direct_answer(interpreted_query, kb_hits)
+        if not direct_answer and signer_query:
+            signer_probe_query = f"{interpreted_query} người ký ban hành tổng bí thư"
+            signer_probe_top_k = max(safe_top_k, 8)
+            signer_probe_hits = self._search_kb(signer_probe_query, signer_probe_top_k)
+            if signer_probe_hits:
+                direct_answer = self._extract_direct_answer(interpreted_query, signer_probe_hits)
+
         extractive_answer: Optional[str] = None
         if not direct_answer:
             extractive_answer = self._extractive_fallback_answer(interpreted_query, kb_hits)
@@ -1222,6 +1378,7 @@ class HybridAnswerRuntime:
 
         response = {
             "success": True,
+            "legal_related": True,
             "query": normalized_query,
             "query_used": interpreted_query,
             "query_correction": query_correction,
@@ -1261,7 +1418,7 @@ _RUNTIME = HybridAnswerRuntime()
 
 @mcp.tool()
 def answer_service_healthcheck() -> Dict[str, Any]:
-    """Return health and dependency status for the standalone legal answer pipeline."""
+    """Return health and dependency status for the legal-answer pipeline."""
     logger.info("Tool answer_service_healthcheck invoked")
     result = _RUNTIME.health()
     logger.info(
@@ -1280,19 +1437,22 @@ def answer_legal_question(
     use_cache: bool = True,
 ) -> Dict[str, Any]:
     """
-    ALWAYS use this tool to see if the question is related to Vietnamese legal and policy documents in the configured knowledge stores. This is the ONLY tool that can access the KB/KG evidence, so it MUST be used for any question that may be answerable by the underlying knowledge.
-    Answer Vietnamese legal and policy questions using the configured knowledge stores.
+    ALWAYS call this tool first for user questions that may be legal or policy related.
+    Use the returned `legal_related` flag to decide whether to continue with legal-answer flow.
+
+    This tool answers Vietnamese legal/policy questions using configured knowledge stores.
+    It is the only tool that can access KB/KG evidence.
 
     Parameters:
-    - question: User question in Vietnamese or English.
+    - question: User question (Vietnamese preferred).
     - top_k: Initial retrieval size (1..MAX_TOP_K).
     - include_graph: Expand related evidence from Neo4j.
     - use_cache: Reuse recent responses when available.
 
-    Usage guidance:
-    - Prefer this tool for Vietnamese regulations, legal procedures, and policy texts.
-    - If returned evidence is weak or missing, respond with explicit low-confidence wording.
-    - Avoid claiming legal certainty without supporting KB/KG evidence.
+    Guidance:
+    - Prioritize this tool for regulations, legal procedures, and policy texts.
+    - If evidence is weak or missing, state that limitation explicitly.
+    - Do not claim legal certainty without KB/KG support.
     """
     logger.info(
         "Tool answer_legal_question invoked top_k=%s include_graph=%s use_cache=%s question=%s",

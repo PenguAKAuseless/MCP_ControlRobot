@@ -57,6 +57,44 @@ def _canonical_or_alias(canonical: str, *aliases: str) -> str:
     return _first_non_empty(*(os.getenv(alias) for alias in aliases))
 
 
+def _response_error_text(response: httpx.Response) -> str:
+    try:
+        payload = response.json()
+        if isinstance(payload, dict):
+            for key in ("error", "message", "detail"):
+                value = payload.get(key)
+                if value:
+                    return str(value)
+    except Exception:
+        pass
+
+    try:
+        return str(response.text or "")
+    except Exception:
+        return ""
+
+
+def _is_model_not_found_404(response: httpx.Response) -> bool:
+    if response.status_code != 404:
+        return False
+    error_text = _response_error_text(response).lower()
+    return "model" in error_text and "not found" in error_text
+
+
+def _is_endpoint_not_found_404(response: httpx.Response) -> bool:
+    if response.status_code != 404:
+        return False
+
+    error_text = _response_error_text(response).lower()
+    if not error_text:
+        return True
+
+    if "model" in error_text and "not found" in error_text:
+        return False
+
+    return "not found" in error_text
+
+
 class ProviderClientFallback:
     def __init__(
         self,
@@ -445,6 +483,11 @@ class ProviderClientFallback:
 
         with httpx.Client(timeout=self.timeout_seconds) as client:
             response = client.post(f"{self.local_base_url}/api/generate", json=payload)
+            if _is_model_not_found_404(response):
+                raise RuntimeError(
+                    f"Local generation model '{self.local_llm_model}' is not installed in Ollama. "
+                    f"Run: ollama pull {self.local_llm_model}"
+                )
             response.raise_for_status()
             data = response.json()
 
@@ -464,7 +507,13 @@ class ProviderClientFallback:
                         "input": text,
                     },
                 )
-                if response.status_code == 404:
+                if _is_model_not_found_404(response):
+                    raise RuntimeError(
+                        f"Local embedding model '{self.local_embedding_model}' is not installed in Ollama. "
+                        f"Run: ollama pull {self.local_embedding_model}"
+                    )
+
+                if _is_endpoint_not_found_404(response):
                     response = client.post(
                         f"{self.local_base_url}/api/embeddings",
                         json={
@@ -472,6 +521,13 @@ class ProviderClientFallback:
                             "prompt": text,
                         },
                     )
+
+                if _is_model_not_found_404(response):
+                    raise RuntimeError(
+                        f"Local embedding model '{self.local_embedding_model}' is not installed in Ollama. "
+                        f"Run: ollama pull {self.local_embedding_model}"
+                    )
+
                 response.raise_for_status()
                 data = response.json()
 
