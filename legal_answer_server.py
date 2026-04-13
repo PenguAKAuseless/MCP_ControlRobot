@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import difflib
+import json
 import logging
 import os
 import re
@@ -56,6 +58,33 @@ CACHE_TTL_SECONDS = max(0, int(os.getenv("MCP_CACHE_TTL_SECONDS", "300")))
 CONTEXT_CHAR_BUDGET = max(1000, int(os.getenv("MCP_CONTEXT_CHAR_BUDGET", "2800")))
 MAX_CONTEXT_ITEMS = max(1, int(os.getenv("MCP_MAX_CONTEXT_ITEMS", "8")))
 MAX_ITEM_CHARS = max(120, int(os.getenv("MCP_MAX_ITEM_CHARS", "700")))
+LOCAL_CONTEXT_CHAR_BUDGET = max(800, int(os.getenv("MCP_LOCAL_CONTEXT_CHAR_BUDGET", "1400")))
+LOCAL_MAX_CONTEXT_ITEMS = max(1, int(os.getenv("MCP_LOCAL_MAX_CONTEXT_ITEMS", "4")))
+LOCAL_MAX_ITEM_CHARS = max(120, int(os.getenv("MCP_LOCAL_MAX_ITEM_CHARS", "380")))
+GENERATION_MAX_TOKENS = max(64, int(os.getenv("MCP_GENERATION_MAX_TOKENS", "220")))
+LOCAL_GENERATION_MAX_TOKENS = max(48, int(os.getenv("MCP_LOCAL_GENERATION_MAX_TOKENS", "120")))
+QUERY_VARIANT_MAX_ATTEMPTS = max(1, int(os.getenv("MCP_QUERY_VARIANT_MAX_ATTEMPTS", "2")))
+try:
+    _QUERY_VARIANT_ACCEPT_SCORE_RAW = float(os.getenv("MCP_QUERY_VARIANT_ACCEPT_SCORE", "0.70"))
+except ValueError:
+    _QUERY_VARIANT_ACCEPT_SCORE_RAW = 0.70
+QUERY_VARIANT_ACCEPT_SCORE = max(0.0, min(1.5, _QUERY_VARIANT_ACCEPT_SCORE_RAW))
+try:
+    _EXTRACTIVE_MIN_HIT_SCORE_RAW = float(os.getenv("MCP_EXTRACTIVE_MIN_HIT_SCORE", "0.62"))
+except ValueError:
+    _EXTRACTIVE_MIN_HIT_SCORE_RAW = 0.62
+EXTRACTIVE_MIN_HIT_SCORE = max(0.0, min(1.5, _EXTRACTIVE_MIN_HIT_SCORE_RAW))
+try:
+    _EXTRACTIVE_MIN_SENTENCE_SCORE_RAW = float(os.getenv("MCP_EXTRACTIVE_MIN_SENTENCE_SCORE", "0.30"))
+except ValueError:
+    _EXTRACTIVE_MIN_SENTENCE_SCORE_RAW = 0.30
+EXTRACTIVE_MIN_SENTENCE_SCORE = max(0.0, min(1.5, _EXTRACTIVE_MIN_SENTENCE_SCORE_RAW))
+SKIP_GRAPH_WHEN_EXTRACTIVE = str(os.getenv("MCP_SKIP_GRAPH_WHEN_EXTRACTIVE", "1")).strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 VECTOR_SEARCH_OVERSAMPLE = max(1, int(os.getenv("MCP_VECTOR_SEARCH_OVERSAMPLE", "8")))
 MAX_VECTOR_CANDIDATES = max(MAX_TOP_K, int(os.getenv("MCP_MAX_VECTOR_CANDIDATES", "64")))
 API_KEY_RE = re.compile(r"sk-[^\s'\"}]+")
@@ -67,6 +96,42 @@ try:
 except ValueError:
     _LEXICAL_RERANK_WEIGHT_RAW = 0.45
 LEXICAL_RERANK_WEIGHT = min(0.9, max(0.0, _LEXICAL_RERANK_WEIGHT_RAW))
+
+QUERY_ABBREVIATION_PATTERNS: List[Tuple[str, str]] = [
+    (r"\bnq\b", "nghị quyết"),
+    (r"\bkhcn\b", "khoa học công nghệ"),
+    (r"\bdmst\b", "đổi mới sáng tạo"),
+    (r"\bc[đd]s\b", "chuyển đổi số"),
+]
+
+CANONICAL_PHRASE_MAP: Dict[str, str] = {
+    "nghi quyet": "nghị quyết",
+    "khoa hoc cong nghe": "khoa học công nghệ",
+    "doi moi sang tao": "đổi mới sáng tạo",
+    "chuyen doi so": "chuyển đổi số",
+    "bo chinh tri": "bộ chính trị",
+    "tong bi thu": "tổng bí thư",
+}
+
+CANONICAL_TOKEN_MAP: Dict[str, str] = {
+    "ve": "về",
+    "cua": "của",
+    "la": "là",
+    "duoc": "được",
+    "ngay": "ngày",
+    "thang": "tháng",
+    "nam": "năm",
+    "doi": "đổi",
+}
+
+KNOWN_QUERY_TOKENS = {
+    "nghi", "quyet", "so", "ve", "dot", "pha", "phat", "trien", "khoa", "hoc", "cong", "nghe",
+    "doi", "moi", "sang", "tao", "chuyen", "quoc", "gia", "tong", "bi", "thu", "bo", "chinh",
+    "tri", "ban", "hanh", "ngay", "thang", "nam", "co", "quan", "chu", "de", "yeu", "to", "muc",
+    "tieu", "tong", "quat", "lanh", "dao", "toan", "dien", "nguoi", "dan", "doanh", "nghiep",
+    "nha", "khoa", "hoc", "then", "chot", "the", "che", "du", "lieu", "tu", "duy", "ha", "tang",
+    "an", "ninh", "mang", "khong", "gian", "su", "xuyen", "khong", "the", "tach", "roi", "57", "tw",
+}
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -105,6 +170,123 @@ def _sanitize_error_text(error: Any) -> str:
 
 def _preview_query(query: str, max_chars: int = 160) -> str:
     return _truncate(" ".join((query or "").split()), max_chars)
+
+
+def _preview_result_payload(payload: Any, max_chars: int = 1800) -> str:
+    try:
+        compact = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        compact = str(payload)
+    return _truncate_with_tail(compact, max_chars)
+
+
+def _expand_query_abbreviations(query: str) -> str:
+    expanded = query or ""
+    for pattern, replacement in QUERY_ABBREVIATION_PATTERNS:
+        expanded = re.sub(pattern, replacement, expanded, flags=re.IGNORECASE)
+    return _normalize_query(expanded)
+
+
+def _restore_common_legal_phrases(query: str) -> str:
+    normalized_tokens = [token for token in re.findall(r"[a-z0-9]+", _normalize_for_tokens(query)) if token]
+    if not normalized_tokens:
+        return _normalize_query(query)
+
+    phrase_specs = sorted(
+        [([part for part in phrase.split() if part], canonical) for phrase, canonical in CANONICAL_PHRASE_MAP.items()],
+        key=lambda item: len(item[0]),
+        reverse=True,
+    )
+
+    out_parts: List[str] = []
+    idx = 0
+    while idx < len(normalized_tokens):
+        matched = False
+        for phrase_tokens, canonical_phrase in phrase_specs:
+            span = len(phrase_tokens)
+            if span == 0 or idx + span > len(normalized_tokens):
+                continue
+            if normalized_tokens[idx : idx + span] == phrase_tokens:
+                out_parts.append(canonical_phrase)
+                idx += span
+                matched = True
+                break
+
+        if matched:
+            continue
+
+        token = normalized_tokens[idx]
+        canonical_token = CANONICAL_TOKEN_MAP.get(token)
+        out_parts.append(canonical_token if canonical_token is not None else token)
+        idx += 1
+
+    return _normalize_query(" ".join(out_parts))
+
+
+def _fuzzy_correct_query_tokens(query: str, cutoff: float = 0.86) -> Tuple[str, List[Dict[str, str]]]:
+    normalized = _normalize_for_tokens(query)
+    tokens = [token for token in re.findall(r"[a-z0-9]+", normalized) if token]
+    if not tokens:
+        return "", []
+
+    known_tokens = sorted(KNOWN_QUERY_TOKENS)
+    corrected_tokens: List[str] = []
+    corrections: List[Dict[str, str]] = []
+
+    for token in tokens:
+        if token in KNOWN_QUERY_TOKENS or len(token) < 4:
+            corrected_tokens.append(token)
+            continue
+
+        close = difflib.get_close_matches(token, known_tokens, n=1, cutoff=cutoff)
+        if close and abs(len(close[0]) - len(token)) <= 2:
+            corrected_tokens.append(close[0])
+            corrections.append({"from": token, "to": close[0]})
+        else:
+            corrected_tokens.append(token)
+
+    return " ".join(corrected_tokens), corrections
+
+
+def _build_query_variants(question: str) -> List[Dict[str, Any]]:
+    variants: List[Dict[str, Any]] = []
+    seen = set()
+
+    def push(query_text: str, method: str, details: Optional[List[Dict[str, str]]] = None) -> None:
+        cleaned = _normalize_query(query_text)
+        if not cleaned or cleaned in seen:
+            return
+        variant: Dict[str, Any] = {"query": cleaned, "method": method}
+        if details:
+            variant["details"] = details
+        variants.append(variant)
+        seen.add(cleaned)
+
+    base_query = _normalize_query(question)
+    push(base_query, "original")
+
+    expanded_query = _expand_query_abbreviations(base_query)
+    if expanded_query != base_query:
+        push(expanded_query, "abbreviation_expansion")
+
+    accent_insensitive = _normalize_for_tokens(expanded_query or base_query)
+    if accent_insensitive and accent_insensitive != _normalize_for_tokens(base_query):
+        push(accent_insensitive, "accent_insensitive_normalization")
+
+    fuzzy_query, corrections = _fuzzy_correct_query_tokens(accent_insensitive or expanded_query or base_query)
+    if fuzzy_query and fuzzy_query != accent_insensitive:
+        push(fuzzy_query, "fuzzy_token_correction", corrections)
+
+    restored_query = _restore_common_legal_phrases(fuzzy_query or accent_insensitive or expanded_query or base_query)
+    if restored_query and restored_query != (fuzzy_query or accent_insensitive):
+        push(restored_query, "canonical_phrase_restore")
+
+    return variants or [{"query": base_query, "method": "original"}]
+
+
+def _split_text_to_sentences(text: str) -> List[str]:
+    parts = re.split(r"(?:\r?\n)+|(?<=[.!?;:])\s+", text or "")
+    return [" ".join(part.split()).strip() for part in parts if part and part.strip()]
 
 
 def _env_flag(name: str, default: str = "0") -> bool:
@@ -198,7 +380,8 @@ class HybridAnswerRuntime:
         self._neo4j_database = os.getenv("MCP_NEO4J_DATABASE", "").strip()
         self._require_neo4j = _env_flag("MCP_REQUIRE_NEO4J", "0")
 
-        self._verify_provider_on_startup = _env_flag("MCP_VERIFY_PROVIDER_ON_STARTUP", "1")
+        default_verify_on_startup = "0" if self._provider_fallback.local_mode else "1"
+        self._verify_provider_on_startup = _env_flag("MCP_VERIFY_PROVIDER_ON_STARTUP", default_verify_on_startup)
         self._verify_embeddings_on_startup = _env_flag("MCP_VERIFY_PROVIDER_EMBEDDINGS", "1")
 
         self._answer_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -615,23 +798,31 @@ class HybridAnswerRuntime:
 
         return output
 
-    def _build_context(self, kb_hits: List[Dict[str, Any]], kg_hits: List[Dict[str, Any]]) -> str:
+    def _build_context(
+        self,
+        kb_hits: List[Dict[str, Any]],
+        kg_hits: List[Dict[str, Any]],
+        *,
+        char_budget: int = CONTEXT_CHAR_BUDGET,
+        max_items: int = MAX_CONTEXT_ITEMS,
+        max_item_chars: int = MAX_ITEM_CHARS,
+    ) -> str:
         lines: List[str] = []
         used_chars = 0
 
         def push(block: str) -> bool:
             nonlocal used_chars
-            if used_chars >= CONTEXT_CHAR_BUDGET:
+            if used_chars >= char_budget:
                 return False
-            block = _truncate(block, max(1, CONTEXT_CHAR_BUDGET - used_chars))
+            block = _truncate(block, max(1, char_budget - used_chars))
             lines.append(block)
             used_chars += len(block)
-            return used_chars < CONTEXT_CHAR_BUDGET
+            return used_chars < char_budget
 
         if kb_hits:
             push("=== Knowledge Base (Milvus) ===\n")
-        for idx, item in enumerate(kb_hits[:MAX_CONTEXT_ITEMS], 1):
-            text = _truncate_with_tail(item.get("text", ""), MAX_ITEM_CHARS)
+        for idx, item in enumerate(kb_hits[:max_items], 1):
+            text = _truncate_with_tail(item.get("text", ""), max_item_chars)
             row = (
                 f"[KB-{idx}] doc={item.get('doc_id', '')} article={item.get('article_id', '')} "
                 f"score={item.get('score', 0.0):.4f}\n{text}\n"
@@ -639,10 +830,10 @@ class HybridAnswerRuntime:
             if not push(row):
                 break
 
-        if kg_hits and used_chars < CONTEXT_CHAR_BUDGET:
+        if kg_hits and used_chars < char_budget:
             push("\n=== Knowledge Graph (Neo4j) ===\n")
-        for idx, item in enumerate(kg_hits[:MAX_CONTEXT_ITEMS], 1):
-            text = _truncate_with_tail(item.get("text", ""), MAX_ITEM_CHARS)
+        for idx, item in enumerate(kg_hits[:max_items], 1):
+            text = _truncate_with_tail(item.get("text", ""), max_item_chars)
             row = (
                 f"[KG-{idx}] type={item.get('label', '')} relation={item.get('relation_type', '')} "
                 f"doc={item.get('doc_id', '')} article={item.get('article_id', '')}\n{text}\n"
@@ -651,6 +842,40 @@ class HybridAnswerRuntime:
                 break
 
         return "\n".join(lines)
+
+    def _extractive_fallback_answer(self, query: str, kb_hits: List[Dict[str, Any]]) -> Optional[str]:
+        if not kb_hits:
+            return None
+
+        query_tokens = _tokenize(query)
+        if not query_tokens:
+            return None
+
+        best_sentence = ""
+        best_score = 0.0
+        for hit in kb_hits[:3]:
+            hit_score = float(hit.get("score") or 0.0)
+            if hit_score < EXTRACTIVE_MIN_HIT_SCORE:
+                continue
+
+            text = str(hit.get("text") or "").strip()
+            if not text:
+                continue
+
+            for sentence in _split_text_to_sentences(text)[:8]:
+                if len(sentence) < 24:
+                    continue
+
+                lexical = _lexical_overlap_score(query_tokens, sentence)
+                candidate_score = lexical + (0.30 * min(1.0, hit_score))
+                if candidate_score > best_score:
+                    best_score = candidate_score
+                    best_sentence = sentence
+
+        if best_sentence and best_score >= EXTRACTIVE_MIN_SENTENCE_SCORE:
+            return _truncate(best_sentence, 260)
+
+        return None
 
     def _extract_direct_answer(self, query: str, kb_hits: List[Dict[str, Any]]) -> Optional[str]:
         normalized_query = _normalize_for_tokens(query)
@@ -777,28 +1002,33 @@ class HybridAnswerRuntime:
 
         return None
 
-    def _generate_answer(self, query: str, context: str, kb_count: int, kg_count: int) -> str:
+    def _generate_answer(
+        self,
+        query: str,
+        context: str,
+        kb_count: int,
+        kg_count: int,
+        *,
+        max_tokens: Optional[int] = None,
+    ) -> str:
         total_sources = int(kb_count) + int(kg_count)
         prompt = (
-            "You are a Vietnamese legal assistant. Use the provided context as primary evidence.\n\n"
-            f"Evidence summary: KB={kb_count}, KG={kg_count}, total={total_sources}.\n\n"
+            "You are a Vietnamese legal assistant. Use the provided context only.\n\n"
+            f"Evidence summary: KB={kb_count}, KG={kg_count}, total={total_sources}.\n"
             f"Context:\n{context}\n\n"
             f"Question: {query}\n\n"
-            "Response format:\n"
-            "1) First line: direct answer in Vietnamese, short and concrete.\n"
-            "2) Second line (optional): Evidence: [KB-x] or [KG-x].\n"
             "Guidelines:\n"
-            "- Prefer exact wording from context for names, dates, organizations, and numeric values.\n"
-            "- Keep the answer brief and avoid unnecessary explanation.\n"
-            "- If evidence is weak (fewer than 2 sources), state that evidence is limited before the answer.\n"
-            "- If context is empty or unrelated, explicitly say the question is outside the current knowledge base and suggest consulting legal experts.\n"
-            "- Do not invent legal facts that are not present in context."
+            "- Return at most 2 short lines in Vietnamese.\n"
+            "- Prefer exact wording from context for names, dates, organizations, and numbers.\n"
+            "- If evidence is weak, say so briefly and give the closest supported answer.\n"
+            "- Do not invent facts not present in context."
         )
 
         answer_text, provider = self._provider_fallback.generate_text(
             prompt=prompt,
-            system="Answer in Vietnamese. Be concise, factual, and grounded in the provided context.",
-            temperature=0.1,
+            system="Answer in Vietnamese. Concise, factual, grounded. Max 2 lines.",
+            temperature=0.0,
+            max_tokens=max_tokens,
         )
         self._active_generation_provider = provider
         return answer_text
@@ -820,16 +1050,92 @@ class HybridAnswerRuntime:
                 return out
 
         t0 = time.perf_counter()
+        query_variants = _build_query_variants(normalized_query)
+        selected_variant = query_variants[0]
+        selected_kb_hits: List[Dict[str, Any]] = []
+        best_variant_score = -1.0
+
         t_retrieve_start = time.perf_counter()
-        kb_hits = self._search_kb(normalized_query, safe_top_k)
-        kg_hits = self._expand_kg(kb_hits, safe_top_k) if include_graph else []
+        for idx, variant in enumerate(query_variants):
+            if idx >= QUERY_VARIANT_MAX_ATTEMPTS:
+                break
+
+            candidate_kb_hits = self._search_kb(variant["query"], safe_top_k)
+            if not candidate_kb_hits:
+                continue
+
+            candidate_score = 0.0
+            if candidate_kb_hits:
+                candidate_score += float(candidate_kb_hits[0].get("score", 0.0))
+
+            should_use_candidate = candidate_score > best_variant_score
+            if not should_use_candidate and abs(candidate_score - best_variant_score) < 1e-9:
+                selected_method = str(selected_variant.get("method") or "")
+                candidate_method = str(variant.get("method") or "")
+                if selected_method == "original" and candidate_method != "original":
+                    should_use_candidate = True
+
+            if should_use_candidate:
+                best_variant_score = candidate_score
+                selected_variant = variant
+                selected_kb_hits = candidate_kb_hits
+
+            top_score = float(candidate_kb_hits[0].get("score", 0.0)) if candidate_kb_hits else 0.0
+            if top_score >= QUERY_VARIANT_ACCEPT_SCORE:
+                break
+
+        kb_hits = selected_kb_hits
         retrieve_ms = (time.perf_counter() - t_retrieve_start) * 1000.0
 
-        if not kb_hits and not kg_hits:
+        query_used = selected_variant.get("query", normalized_query)
+        query_correction: Optional[Dict[str, Any]] = None
+        if query_used != normalized_query:
+            query_correction = {
+                "original_query": normalized_query,
+                "corrected_query": _restore_common_legal_phrases(query_used),
+                "method": selected_variant.get("method"),
+            }
+            if selected_variant.get("details"):
+                query_correction["token_changes"] = selected_variant.get("details")
+
+        # Always compute cheap canonical normalization so small typos/abbreviations can
+        # be surfaced back to callers even when retrieval succeeded on the first try.
+        if query_correction is None:
+            expanded_query = _expand_query_abbreviations(normalized_query)
+            normalized_for_check = _normalize_for_tokens(normalized_query)
+            should_surface_canonical = (
+                expanded_query != normalized_query
+                or "doi moi sang tao" in normalized_for_check
+            )
+
+            canonical_candidate = _restore_common_legal_phrases(expanded_query)
+            if should_surface_canonical and canonical_candidate and canonical_candidate != normalized_query:
+                query_correction = {
+                    "original_query": normalized_query,
+                    "corrected_query": canonical_candidate,
+                    "method": "canonical_normalization",
+                }
+
+        interpreted_query = (
+            str(query_correction.get("corrected_query"))
+            if query_correction and query_correction.get("corrected_query")
+            else query_used
+        )
+
+        if not kb_hits:
+            answer_text = "No relevant evidence found in the configured knowledge stores."
+            if query_correction:
+                answer_text = (
+                    f"Đã tự hiệu chỉnh truy vấn gần đúng thành: \"{query_correction['corrected_query']}\". "
+                    + answer_text
+                )
+
             response = {
                 "success": True,
                 "query": normalized_query,
-                "answer": "No relevant evidence found in the configured knowledge stores.",
+                "query_used": interpreted_query,
+                "query_correction": query_correction,
+                "answer": answer_text,
                 "retrieved": {"kb": 0, "kg": 0},
                 "sources": [],
                 "latency_ms": {
@@ -843,17 +1149,55 @@ class HybridAnswerRuntime:
                 self._cache_set(cache_key, response)
             return response
 
-        context = self._build_context(kb_hits, kg_hits)
+        direct_answer = self._extract_direct_answer(interpreted_query, kb_hits)
+        extractive_answer: Optional[str] = None
+        if not direct_answer:
+            extractive_answer = self._extractive_fallback_answer(interpreted_query, kb_hits)
 
-        direct_answer = self._extract_direct_answer(normalized_query, kb_hits)
+        should_expand_graph = bool(include_graph)
+        if (direct_answer or extractive_answer) and SKIP_GRAPH_WHEN_EXTRACTIVE:
+            should_expand_graph = False
+
+        kg_hits = self._expand_kg(kb_hits, safe_top_k) if should_expand_graph else []
+
         if direct_answer:
             answer_text = direct_answer
             self._active_generation_provider = "extractive"
             generate_ms = 0.0
+        elif extractive_answer:
+            answer_text = extractive_answer
+            self._active_generation_provider = "extractive"
+            generate_ms = 0.0
         else:
+            is_local_mode = bool(getattr(self._provider_fallback, "local_mode", False))
+            context_budget = LOCAL_CONTEXT_CHAR_BUDGET if is_local_mode else CONTEXT_CHAR_BUDGET
+            context_items = LOCAL_MAX_CONTEXT_ITEMS if is_local_mode else MAX_CONTEXT_ITEMS
+            context_item_chars = LOCAL_MAX_ITEM_CHARS if is_local_mode else MAX_ITEM_CHARS
+            generation_max_tokens = LOCAL_GENERATION_MAX_TOKENS if is_local_mode else GENERATION_MAX_TOKENS
+
+            context = self._build_context(
+                kb_hits,
+                kg_hits,
+                char_budget=context_budget,
+                max_items=context_items,
+                max_item_chars=context_item_chars,
+            )
+
             t_generate_start = time.perf_counter()
-            answer_text = self._generate_answer(normalized_query, context, kb_count=len(kb_hits), kg_count=len(kg_hits))
+            answer_text = self._generate_answer(
+                interpreted_query,
+                context,
+                kb_count=len(kb_hits),
+                kg_count=len(kg_hits),
+                max_tokens=generation_max_tokens,
+            )
             generate_ms = (time.perf_counter() - t_generate_start) * 1000.0
+
+        if query_correction:
+            answer_text = (
+                f"Đã tự hiệu chỉnh truy vấn gần đúng thành: \"{query_correction['corrected_query']}\".\n"
+                f"{answer_text}"
+            )
 
         sources: List[Dict[str, Any]] = []
         for item in kb_hits:
@@ -879,6 +1223,8 @@ class HybridAnswerRuntime:
         response = {
             "success": True,
             "query": normalized_query,
+            "query_used": interpreted_query,
+            "query_correction": query_correction,
             "answer": answer_text,
             "retrieved": {"kb": len(kb_hits), "kg": len(kg_hits)},
             "providers": {
@@ -896,6 +1242,9 @@ class HybridAnswerRuntime:
 
         if use_cache:
             self._cache_set(cache_key, response)
+            alias_key = self._cache_key(interpreted_query, safe_top_k, include_graph)
+            if alias_key != cache_key:
+                self._cache_set(alias_key, response)
 
         return response
 
@@ -916,8 +1265,9 @@ def answer_service_healthcheck() -> Dict[str, Any]:
     logger.info("Tool answer_service_healthcheck invoked")
     result = _RUNTIME.health()
     logger.info(
-        "Tool answer_service_healthcheck completed success=%s",
+        "Tool answer_service_healthcheck completed success=%s result=%s",
         result.get("success"),
+        _preview_result_payload(result, max_chars=1200),
     )
     return result
 
@@ -930,6 +1280,7 @@ def answer_legal_question(
     use_cache: bool = True,
 ) -> Dict[str, Any]:
     """
+    ALWAYS use this tool to see if the question is related to Vietnamese legal and policy documents in the configured knowledge stores. This is the ONLY tool that can access the KB/KG evidence, so it MUST be used for any question that may be answerable by the underlying knowledge.
     Answer Vietnamese legal and policy questions using the configured knowledge stores.
 
     Parameters:
@@ -961,13 +1312,14 @@ def answer_legal_question(
         retrieved = result.get("retrieved") or {}
         providers = result.get("providers") or {}
         logger.info(
-            "Tool answer_legal_question completed success=%s kb=%s kg=%s cache_hit=%s provider=%s total_latency_ms=%s",
+            "Tool answer_legal_question completed success=%s kb=%s kg=%s cache_hit=%s provider=%s total_latency_ms=%s result=%s",
             result.get("success"),
             retrieved.get("kb"),
             retrieved.get("kg"),
             result.get("cache_hit"),
             providers.get("generation"),
             latency.get("total"),
+            _preview_result_payload(result),
         )
         return result
     except Exception as exc:

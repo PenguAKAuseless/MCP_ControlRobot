@@ -17,8 +17,13 @@ logging.basicConfig(
 
 # Fix UTF-8 encoding for Windows console
 if sys.platform == 'win32':
-    sys.stderr.reconfigure(encoding='utf-8')
-    sys.stdout.reconfigure(encoding='utf-8')
+    stderr_reconfigure = getattr(sys.stderr, 'reconfigure', None)
+    if callable(stderr_reconfigure):
+        stderr_reconfigure(encoding='utf-8')
+
+    stdout_reconfigure = getattr(sys.stdout, 'reconfigure', None)
+    if callable(stdout_reconfigure):
+        stdout_reconfigure(encoding='utf-8')
 
 # Create an MCP server
 mcp = FastMCP("Calculator")
